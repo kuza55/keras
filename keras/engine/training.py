@@ -456,7 +456,7 @@ def generator_queue(generator, max_q_size=10,
 class Model(Container):
 
     def compile(self, optimizer, loss, metrics=[], loss_weights=None,
-                sample_weight_mode=None, **kwargs):
+                sample_weight_mode=None, polyak=False, **kwargs):
         '''Configures the model for training.
 
         # Arguments
@@ -478,6 +478,7 @@ class Model(Container):
                 If the model has multiple outputs, you can use a different
                 `sample_weight_mode` on each output by passing a
                 dictionary or a list of modes.
+            polyak: Enable polyak averaging
             kwargs: when using the Theano backend, these arguments
                 are passed into K.function. Ignored for Tensorflow backend.
         '''
@@ -485,6 +486,7 @@ class Model(Container):
         self.sample_weight_mode = sample_weight_mode
         self.loss = loss
         self.loss_weights = loss_weights
+        self.polyak = polyak
 
         # prepare loss weights
         if loss_weights is None:
@@ -680,6 +682,35 @@ class Model(Container):
         self.test_function = None
         self.predict_function = None
 
+    def _make_polyak_updates(self, trainable_weights, colocate=True, momentum=0.999):
+        weights = []
+        updates = []
+        self.polyak_map = {}
+        switch_ops = []
+        for w in trainable_weights:
+            if colocate and hasattr(w, 'device'):
+                with tf.device(w.device):
+                    pol_w = K.variable(K.get_value(w), dtype=K.dtype(w), name=w.name+"_polyak")
+                    weights.append(pol_w)
+                    self.polyak_map[w] = pol_w
+
+                    up_w = K.moving_average_update(pol_w, w, momentum)
+                    updates.append(up_w)
+
+                    sum = K.update_add(pol_w, w)
+                    with tf.control_dependencies([sum]):
+                        set_w = K.update(w, pol_w - w)
+                        with tf.control_dependencies([set_w]):
+                            set_pol = K.update(pol_w, pol_w - w)
+
+                    switch_ops.append(set_pol)
+
+        self.non_trainable_weights.extends(weights)
+        self.updates.extend(updates)
+
+        self.switch_polyak = K.function([], [], updates=switch_ops)
+
+
     def _make_train_function(self):
         if not hasattr(self, 'train_function'):
             raise Exception('You must compile your model before using it.')
@@ -693,6 +724,9 @@ class Model(Container):
             trainable_weights = collect_trainable_weights(self)
             training_updates = self.optimizer.get_updates(trainable_weights, self.constraints, self.total_loss)
             updates = self.updates + training_updates
+
+            if self.polyak:
+                self._make_polyak_updates()
 
             # returns loss and metrics. Updates weights at each call.
             self.train_function = K.function(inputs,
@@ -859,6 +893,9 @@ class Model(Container):
             or list of arrays of predictions
             (if the model has multiple outputs).
         '''
+        if self.polyak:
+            self.switch_polyak()
+
         nb_sample = ins[0].shape[0]
         outs = []
         if verbose == 1:
@@ -885,6 +922,10 @@ class Model(Container):
                 outs[i][batch_start:batch_end] = batch_out
             if verbose == 1:
                 progbar.update(batch_end)
+                
+        if self.polyak:
+            self.switch_polyak()
+
         if len(outs) == 1:
             return outs[0]
         return outs
@@ -904,6 +945,9 @@ class Model(Container):
             and/or metrics). The attribute `model.metrics_names` will give you
             the display labels for the scalar outputs.
         '''
+        if self.polyak:
+            self.switch_polyak()
+
         nb_sample = ins[0].shape[0]
         outs = []
         if verbose == 1:
@@ -934,6 +978,10 @@ class Model(Container):
                 progbar.update(batch_end)
         for i, out in enumerate(outs):
             outs[i] /= nb_sample
+
+        if self.polyak:
+            self.switch_polyak()
+
         if len(outs) == 1:
             return outs[0]
         return outs
