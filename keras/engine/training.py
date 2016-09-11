@@ -682,12 +682,12 @@ class Model(Container):
         self.test_function = None
         self.predict_function = None
 
-    def _make_polyak_updates(self, trainable_weights, colocate=True, momentum=0.999):
+    def _make_polyak_updates(self, colocate=True, momentum=0.999):
         weights = []
         updates = []
         self.polyak_map = {}
         switch_ops = []
-        for w in trainable_weights:
+        for w in self.trainable_weights:
             if colocate and hasattr(w, 'device'):
                 with tf.device(w.device):
                     pol_w = K.variable(K.get_value(w), dtype=K.dtype(w), name=w.name+"_polyak")
